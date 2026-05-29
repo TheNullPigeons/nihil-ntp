@@ -1,0 +1,29 @@
+#compdef nihil-ntp
+# Zsh completion for nihil-ntp. Works autoloaded (in $fpath) or sourced.
+
+_nihil-ntp() {
+  local -a subcmds
+  subcmds=(
+    'status:show current state and the live offset'
+    'enable:re-enable syncing with the stored server'
+    'disable:stop syncing'
+    'sync:force a sync now'
+    '--clock:set the real system clock (fallback faketime)'
+    '--help:show this help'
+  )
+
+  # First word: a subcommand/flag, or directly an NTP server (IP/host).
+  if (( CURRENT == 2 )); then
+    _describe -t commands 'nihil-ntp command' subcmds
+    _hosts
+    return
+  fi
+
+  # `nihil-ntp --clock <server>`
+  if (( CURRENT == 3 )) && [[ ${words[2]} == (--clock|-c) ]]; then
+    _hosts
+    _message 'NTP server IP/host'
+  fi
+}
+
+_nihil-ntp "$@"

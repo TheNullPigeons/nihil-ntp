@@ -1,0 +1,305 @@
+#!/bin/bash
+# nihil-ntp - sync the container clock to a target NTP server (typically a DC).
+#
+# In an AD engagement Kerberos rejects tickets when the client clock drifts more
+# than a few minutes from the KDC. nihil-ntp points every terminal at a chosen
+# NTP source (the DC) so the whole box stays in sync.
+#
+# Default mode is faketime: it never touches the real clock. nihil-ntp measures
+# the offset to the server and applies it through libfaketime (LD_PRELOAD) in
+# each shell, so every command sees DC time. This is safe and needs no
+# privilege, but only shifts libc programs (not static/Go binaries).
+#
+# With --clock it instead sets the real system clock (needs a privileged
+# container / CAP_SYS_TIME). That covers every tool but, in Docker, the clock is
+# shared with the host. If setting the clock fails it falls back to faketime.
+#
+# Usage:
+#   nihil-ntp <ip|host>          set the NTP server and enable, faketime (sync now)
+#   nihil-ntp --clock <ip|host>  same but set the real clock (fallback faketime)
+#   nihil-ntp enable             re-enable with the stored server (sync now)
+#   nihil-ntp disable            stop syncing (new terminals are untouched)
+#   nihil-ntp status             show current state and the live offset
+#   nihil-ntp sync               force a sync now
+#   nihil-ntp -h|--help          this help
+
+set -u
+
+# nihil-ntp must always operate on the REAL clock. If it is invoked from a shell
+# that already has our faketime offset applied, a faked ntpdate/date would see a
+# clock that already matches the server (offset ~0) and we would wrongly think we
+# are in sync, wiping the offset. Strip the preload for this whole process.
+unset LD_PRELOAD FAKETIME FAKETIME_NO_CACHE
+
+CONF="${NIHIL_NTP_CONF:-/etc/nihil-ntp.conf}"
+STALE_SECONDS=300   # background refresh only re-queries when older than this
+
+# --- output helpers --------------------------------------------------------
+_c() { [ -t 1 ] && printf '%b' "$1" || true; }
+msg()  { _c '\033[32m'; printf '[nihil-ntp] %s\n' "$*"; _c '\033[0m'; }
+warn() { _c '\033[33m'; printf '[nihil-ntp] %s\n' "$*"; _c '\033[0m'; }
+err()  { _c '\033[31m'; printf '[nihil-ntp] %s\n' "$*" >&2; _c '\033[0m'; }
+
+# --- config persistence ----------------------------------------------------
+NIHIL_NTP_SERVER=""
+NIHIL_NTP_ENABLED=0
+NIHIL_NTP_MODE=""
+NIHIL_NTP_WANT_CLOCK=0     # 0 = faketime (default), 1 = set the real clock (--clock)
+NIHIL_NTP_FAKETIME_OFFSET=""
+NIHIL_NTP_FAKETIME_LIB=""
+NIHIL_NTP_LAST_SYNC=0
+
+load_conf() {
+    # shellcheck disable=SC1090
+    [ -f "$CONF" ] && . "$CONF" 2>/dev/null || true
+}
+
+write_conf() {
+    # Write atomically: background refreshes from several terminals may race.
+    local tmp
+    tmp="$(mktemp "${CONF}.XXXXXX" 2>/dev/null)" || tmp="${CONF}.tmp.$$"
+    cat >"$tmp" <<EOF
+# Managed by nihil-ntp - do not edit by hand.
+NIHIL_NTP_SERVER="${NIHIL_NTP_SERVER}"
+NIHIL_NTP_ENABLED=${NIHIL_NTP_ENABLED}
+NIHIL_NTP_MODE="${NIHIL_NTP_MODE}"
+NIHIL_NTP_WANT_CLOCK=${NIHIL_NTP_WANT_CLOCK}
+NIHIL_NTP_FAKETIME_OFFSET="${NIHIL_NTP_FAKETIME_OFFSET}"
+NIHIL_NTP_FAKETIME_LIB="${NIHIL_NTP_FAKETIME_LIB}"
+NIHIL_NTP_LAST_SYNC=${NIHIL_NTP_LAST_SYNC}
+EOF
+    mv -f "$tmp" "$CONF"
+}
+
+find_faketime_lib() {
+    local p
+    for p in /usr/lib/faketime/libfaketime.so.1 \
+             /usr/lib/faketime/libfaketime.so \
+             /usr/lib64/faketime/libfaketime.so.1; do
+        [ -e "$p" ] && { echo "$p"; return 0; }
+    done
+    find /usr/lib /usr/lib64 -name 'libfaketime.so*' 2>/dev/null | head -1
+}
+
+# --- NTP primitives --------------------------------------------------------
+# Echo the offset to the server in seconds (server_time - local_time), or
+# nothing if the server is unreachable. Query only, no privilege required.
+query_offset() {
+    local server="$1" out
+    if command -v ntpdate >/dev/null 2>&1; then
+        out=$(ntpdate -q -u "$server" 2>/dev/null) || true
+        echo "$out" | grep -oE 'offset [-+]?[0-9.]+' | tail -1 | awk '{print $2}'
+    elif command -v sntp >/dev/null 2>&1; then
+        out=$(sntp "$server" 2>/dev/null) || true
+        echo "$out" | grep -oE '[-+][0-9]+\.[0-9]+' | head -1
+    fi
+}
+
+# Try to set the real system clock. Returns 0 on success, non-zero otherwise
+# (unreachable server or no permission to set the clock).
+set_clock() {
+    local server="$1"
+    if command -v ntpdate >/dev/null 2>&1; then
+        ntpdate -u "$server" >/dev/null 2>&1
+    elif command -v sntp >/dev/null 2>&1; then
+        sntp -sS "$server" >/dev/null 2>&1
+    else
+        return 2
+    fi
+}
+
+# Round a float offset like "+120.456" / "-3.2" to an integer-second faketime
+# spec like "+120s" / "-3s".
+to_faketime() {
+    local off="$1" secs
+    secs="${off%%.*}"
+    case "$secs" in
+        ""|"+"|"-") secs=0 ;;
+    esac
+    case "$secs" in
+        -*|+*) : ;;
+        *) secs="+$secs" ;;
+    esac
+    echo "${secs}s"
+}
+
+# True (exit 0) when |offset seconds| is within tolerance, i.e. the clock is
+# effectively in sync with the server. Kerberos tolerates a few minutes; we use
+# a tight 2s window so we can tell a real clock step from a no-op.
+offset_is_small() {
+    awk -v o="$1" 'BEGIN { o = o + 0; if (o < 0) o = -o; exit (o < 2) ? 0 : 1 }'
+}
+
+# Render a signed seconds value (int or float) as a human delta like "+5h59m58s".
+human_offset() {
+    awk -v v="$1" 'BEGIN {
+        s = v + 0; sign = (s < 0) ? "-" : "+"; if (s < 0) s = -s; s = int(s + 0.5)
+        h = int(s / 3600); m = int((s % 3600) / 60); sec = s % 60; out = ""
+        if (h > 0) out = out h "h"
+        if (m > 0) out = out m "m"
+        if (sec > 0 || out == "") out = out sec "s"
+        printf "%s%s", sign, out
+    }'
+}
+
+# --- core actions ----------------------------------------------------------
+# Configure faketime mode for the given offset. Returns 1 if libfaketime is
+# absent. Does NOT touch the real clock.
+apply_faketime() {
+    local offset="$1" quiet="$2"
+    NIHIL_NTP_FAKETIME_LIB="$(find_faketime_lib)"
+    if [ -z "$NIHIL_NTP_FAKETIME_LIB" ]; then
+        [ "$quiet" = quiet ] || err "libfaketime is missing; install the libfaketime package"
+        return 1
+    fi
+    NIHIL_NTP_MODE="faketime"
+    NIHIL_NTP_FAKETIME_OFFSET="$(to_faketime "$offset")"
+    if [ "$quiet" != quiet ]; then
+        msg "faketime offset ${NIHIL_NTP_FAKETIME_OFFSET} set for $NIHIL_NTP_SERVER"
+        warn "note: faketime only shifts libc programs, not static/Go binaries (use --clock for those)"
+    fi
+}
+
+do_sync() {
+    local quiet="${1:-}"
+    if [ -z "$NIHIL_NTP_SERVER" ]; then
+        [ "$quiet" = quiet ] || err "no NTP server set. Run: nihil-ntp <ip>"
+        return 1
+    fi
+
+    local offset
+    offset=$(query_offset "$NIHIL_NTP_SERVER")
+    if [ -z "$offset" ]; then
+        [ "$quiet" = quiet ] || err "cannot reach NTP server $NIHIL_NTP_SERVER"
+        return 1
+    fi
+
+    # Already within tolerance: nothing to fake or set.
+    if offset_is_small "$offset"; then
+        NIHIL_NTP_MODE="synced"
+        NIHIL_NTP_FAKETIME_OFFSET=""
+        [ "$quiet" = quiet ] || msg "already in sync with $NIHIL_NTP_SERVER (offset ${offset}s)"
+        NIHIL_NTP_LAST_SYNC="$(date +%s 2>/dev/null || echo 0)"
+        write_conf
+        return 0
+    fi
+
+    if [ "${NIHIL_NTP_WANT_CLOCK:-0}" = 1 ]; then
+        # Opt-in (--clock): set the real clock, then VERIFY by re-querying.
+        # ntpdate exits 0 even without the privilege to step the clock, so trust
+        # the measurement, not the exit code. Fall back to faketime if it failed.
+        set_clock "$NIHIL_NTP_SERVER" >/dev/null 2>&1
+        local after
+        after=$(query_offset "$NIHIL_NTP_SERVER")
+        if [ -n "$after" ] && offset_is_small "$after"; then
+            NIHIL_NTP_MODE="clock"
+            NIHIL_NTP_FAKETIME_OFFSET=""
+            [ "$quiet" = quiet ] || msg "system clock synced to $NIHIL_NTP_SERVER (was ${offset}s off)"
+        else
+            [ "$quiet" = quiet ] || warn "could not set the system clock (no privilege?); falling back to faketime"
+            apply_faketime "$offset" "$quiet" || return 1
+        fi
+    else
+        # Default: faketime only, never touch the real clock.
+        apply_faketime "$offset" "$quiet" || return 1
+    fi
+
+    NIHIL_NTP_LAST_SYNC="$(date +%s 2>/dev/null || echo 0)"
+    write_conf
+}
+
+set_server() {
+    local server="$1" want_clock="${2:-}"
+    case "$server" in
+        -*) err "invalid server '$server'"; return 1 ;;
+    esac
+    NIHIL_NTP_SERVER="$server"
+    NIHIL_NTP_ENABLED=1     # setting an IP enables by default
+    [ "$want_clock" = clock ] && NIHIL_NTP_WANT_CLOCK=1 || NIHIL_NTP_WANT_CLOCK=0
+    write_conf
+    msg "NTP server set to $server (enabled, $([ "$NIHIL_NTP_WANT_CLOCK" = 1 ] && echo 'clock mode' || echo 'faketime mode'))"
+    do_sync
+}
+
+do_enable() {
+    if [ -z "$NIHIL_NTP_SERVER" ]; then
+        err "no NTP server set. Run: nihil-ntp <ip>"
+        return 1
+    fi
+    NIHIL_NTP_ENABLED=1
+    write_conf
+    msg "enabled (server $NIHIL_NTP_SERVER)"
+    do_sync
+}
+
+do_disable() {
+    NIHIL_NTP_ENABLED=0
+    NIHIL_NTP_MODE=""
+    NIHIL_NTP_FAKETIME_OFFSET=""
+    write_conf
+    msg "disabled. This shell and new terminals use the real local time."
+    warn "other already-open terminals keep faketime until they are restarted."
+}
+
+do_status() {
+    printf 'server   : %s\n' "${NIHIL_NTP_SERVER:-<none>}"
+    printf 'enabled  : %s\n' "$([ "$NIHIL_NTP_ENABLED" = 1 ] && echo yes || echo no)"
+    printf 'mode     : %s\n' "${NIHIL_NTP_MODE:-<none>}"
+
+    local off_secs=0
+    if [ "$NIHIL_NTP_MODE" = faketime ] && [ -n "${NIHIL_NTP_FAKETIME_OFFSET:-}" ]; then
+        off_secs="$(printf '%s' "$NIHIL_NTP_FAKETIME_OFFSET" | tr -dc '0-9-')"
+        printf 'offset   : %s (%s)\n' "$NIHIL_NTP_FAKETIME_OFFSET" "$(human_offset "$off_secs")"
+    fi
+
+    printf 'last sync: %s\n' "$([ "${NIHIL_NTP_LAST_SYNC:-0}" -gt 0 ] 2>/dev/null && date -d "@$NIHIL_NTP_LAST_SYNC" 2>/dev/null || echo never)"
+
+    # nihil-ntp runs without faketime, so $(date) here is the REAL host clock.
+    local now_epoch
+    now_epoch="$(date +%s 2>/dev/null || echo 0)"
+    printf 'real time: %s\n' "$(date)"
+    # In faketime mode, show what commands actually see (real + offset).
+    if [ "$NIHIL_NTP_MODE" = faketime ] && [ "${off_secs:-0}" != 0 ]; then
+        printf 'tools see: %s\n' "$(date -d "@$(( now_epoch + off_secs ))" 2>/dev/null || echo '?')"
+    fi
+
+    if [ -n "$NIHIL_NTP_SERVER" ]; then
+        local off
+        off=$(query_offset "$NIHIL_NTP_SERVER")
+        if [ -n "$off" ]; then
+            printf 'live diff: %ss (%s) to %s\n' "$off" "$(human_offset "$off")" "$NIHIL_NTP_SERVER"
+        else
+            printf 'live diff: %s unreachable\n' "$NIHIL_NTP_SERVER"
+        fi
+    fi
+}
+
+# Background-friendly: only re-query when the last sync is stale. Called by the
+# shell hook on every new terminal.
+do_maybe_refresh() {
+    [ "$NIHIL_NTP_ENABLED" = 1 ] || return 0
+    [ -n "$NIHIL_NTP_SERVER" ] || return 0
+    local now age
+    now="$(date +%s 2>/dev/null || echo 0)"
+    age=$(( now - ${NIHIL_NTP_LAST_SYNC:-0} ))
+    [ "$age" -lt "$STALE_SECONDS" ] && return 0
+    do_sync quiet
+}
+
+usage() { sed -n '2,30{/^#/!q;s/^# \{0,1\}//;p}' "$0"; }
+
+# --- dispatch --------------------------------------------------------------
+load_conf
+case "${1:-status}" in
+    enable)          do_enable ;;
+    disable)         do_disable ;;
+    status|"")       do_status ;;
+    sync)            do_sync ;;
+    _maybe_refresh)  do_maybe_refresh ;;
+    -h|--help|help)  usage ;;
+    --clock|-c)
+        shift
+        [ -n "${1:-}" ] || { err "usage: nihil-ntp --clock <ip>"; exit 1; }
+        set_server "$1" clock ;;
+    *)               set_server "$1" ;;
+esac
