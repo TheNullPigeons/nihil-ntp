@@ -108,8 +108,8 @@ set_clock() {
     fi
 }
 
-# Round a float offset like "+120.456" / "-3.2" to an integer-second faketime
-# spec like "+120s" / "-3s".
+# Round a float offset like "+120.456" / "-3.2" to a libfaketime
+# relative offset. A bare signed number is interpreted as seconds by libfaketime.
 to_faketime() {
     local off="$1" secs
     secs="${off%%.*}"
@@ -120,7 +120,7 @@ to_faketime() {
         -*|+*) : ;;
         *) secs="+$secs" ;;
     esac
-    echo "${secs}s"
+    echo "${secs}"
 }
 
 # True (exit 0) when |offset seconds| is within tolerance, i.e. the clock is
